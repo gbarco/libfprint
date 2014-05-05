@@ -1,0 +1,6 @@
+#!/bin/bash
+#This should install all needed deps for development on Debian
+
+apt-get install build-essential autoconf automake libtool libusb-1.0.0-dev libssl-dev libmagick++-dev
+
+echo "Now ./autogen.sh" and you should be going
