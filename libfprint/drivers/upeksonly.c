@@ -2,6 +2,12 @@
  * UPEK TouchStrip Sensor-Only driver for libfprint
  * Copyright (C) 2008 Daniel Drake <dsd@gentoo.org>
  *
+ * TCS4C (USB ID 147e:1000) support:
+ * Copyright (C) 2010 Hugo Grostabussiat <dw23.devel@gmail.com>
+ *
+ * TCRD5B (USB ID 147e:1001) support:
+ * Copyright (C) 2014 Vasily Khoruzhick <anarsoul@gmail.com>
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
@@ -27,10 +33,19 @@
 
 #include <fp_internal.h>
 
+#include "upeksonly.h"
+#include "driver_ids.h"
+
 #define CTRL_TIMEOUT	1000
-#define IMG_WIDTH 288
 #define NUM_BULK_TRANSFERS 24
-#define MAX_ROWS 700
+#define MAX_ROWS 1024
+#define MIN_ROWS 64
+
+enum {
+	UPEKSONLY_2016,
+	UPEKSONLY_1000,
+	UPEKSONLY_1001,
+};
 
 struct img_transfer_data {
 	int idx;
@@ -55,10 +70,19 @@ enum sonly_kill_transfers_action {
 	EXEC_CALLBACK,
 };
 
+enum sonly_fs {
+	AWAIT_FINGER,
+	FINGER_DETECTED,
+	FINGER_REMOVED,
+};
+
 struct sonly_dev {
 	gboolean capturing;
 	gboolean deactivating;
 	uint8_t read_reg_result;
+
+	int dev_model;
+	int img_width;
 
 	struct fpi_ssm *loopsm;
 	struct libusb_transfer *img_transfer[NUM_BULK_TRANSFERS];
@@ -72,8 +96,11 @@ struct sonly_dev {
 
 	int wraparounds;
 	int num_blank;
-	int finger_removed;
+	int num_nonblank;
+	enum sonly_fs finger_state;
 	int last_seqnum;
+	int diff_thresh;
+	int total_thresh;
 
 	enum sonly_kill_transfers_action killing_transfers;
 	int kill_status_code;
@@ -81,11 +108,6 @@ struct sonly_dev {
 		struct fpi_ssm *kill_ssm;
 		void (*kill_cb)(struct fp_img_dev *dev);
 	};
-};
-
-struct sonly_regwrite {
-	uint8_t reg;
-	uint8_t value;
 };
 
 /***** IMAGE PROCESSING *****/
@@ -149,13 +171,13 @@ static void cancel_img_transfers(struct fp_img_dev *dev)
 
 static gboolean is_capturing(struct sonly_dev *sdev)
 {
-	return sdev->num_rows < MAX_ROWS && !sdev->finger_removed;
+	return sdev->num_rows < MAX_ROWS && (sdev->finger_state != FINGER_REMOVED);
 }
 
 static void handoff_img(struct fp_img_dev *dev)
 {
 	struct sonly_dev *sdev = dev->priv;
-	size_t size = IMG_WIDTH * sdev->num_rows;
+	size_t size = sdev->img_width * sdev->num_rows;
 	struct fp_img *img = fpi_img_new(size);
 	GSList *elem = sdev->rows;
 	size_t offset = 0;
@@ -168,10 +190,14 @@ static void handoff_img(struct fp_img_dev *dev)
 	fp_dbg("%d rows", sdev->num_rows);
 	img->height = sdev->num_rows;
 
+	/* The scans from this device are rolled right by two colums
+	 * It feels a lot smarter to correct here than mess with it at
+	 * read time*/
 	do {
-		memcpy(img->data + offset, elem->data, IMG_WIDTH);
+		memcpy(img->data + offset, elem->data + 2, sdev->img_width - 2);
+		memcpy(img->data + offset + sdev->img_width - 2, elem->data,  2);
 		g_free(elem->data);
-		offset += IMG_WIDTH;
+		offset += sdev->img_width;
 	} while ((elem = g_slist_next(elem)) != NULL);
 
 	g_slist_free(sdev->rows);
@@ -185,14 +211,14 @@ static void handoff_img(struct fp_img_dev *dev)
 	cancel_img_transfers(dev);
 }
 
-static void compute_rows(unsigned char *a, unsigned char *b, int *diff,
+static void compute_rows(struct sonly_dev *sdev, unsigned char *a, unsigned char *b, int *diff,
 	int *total)
 {
 	int i;
 	int _total = 0;
 	int _diff = 0;
 
-	for (i = 0; i < IMG_WIDTH; i++) {
+	for (i = 0; i < sdev->img_width; i++) {
 		if (a[i] > b[i])
 			_diff += a[i] - b[i];
 		else
@@ -213,24 +239,73 @@ static void row_complete(struct fp_img_dev *dev)
 		int diff;
 		int total;
 
-		compute_rows(lastrow, sdev->rowbuf, &diff, &total);
-		if (total < 52000) {
+		compute_rows(sdev, lastrow, sdev->rowbuf, &diff, &total);
+
+		switch (sdev->finger_state) {
+		case AWAIT_FINGER:
+			if (sdev->deactivating) {
+				sdev->killing_transfers = ITERATE_SSM;
+				sdev->kill_ssm = sdev->loopsm;
+				cancel_img_transfers(dev);
+			}
+			fp_dbg("total: %d", total);
+			if (total < sdev->total_thresh) {
+				sdev->num_nonblank++;
+			} else {
+				sdev->num_nonblank = 0;
+			}
+
+			if (sdev->num_nonblank > 32) {
+				sdev->finger_state = FINGER_DETECTED;
+				fpi_imgdev_report_finger_status(dev, TRUE);
+			}
+			break;
+		case FINGER_DETECTED:
+		case FINGER_REMOVED:
+		default:
+			break;
+		}
+
+		if (total < sdev->total_thresh) {
 			sdev->num_blank = 0;
 		} else {
 			sdev->num_blank++;
-			if (sdev->num_blank > 500) {
-				sdev->finger_removed = 1;
-				fp_dbg("detected finger removal");
+			/* Don't consider the scan complete unless theres at least
+			 * MIN_ROWS recorded or very long blank read occurred.
+			 *
+			 * Typical problem spot: one brief touch before starting the
+			 * actual scan. Happens most commonly if scan is started
+			 * from before the first joint resulting in a gap after the inital touch.
+			 */
+			if ((sdev->num_blank > 500)
+			    && ((sdev->num_rows > MIN_ROWS) || (sdev->num_blank > 5000))) {
+				sdev->finger_state = FINGER_REMOVED;
+				fp_dbg("detected finger removal. Blank rows: %d, Full rows: %d", sdev->num_blank, sdev->num_rows);
 				handoff_img(dev);
 				return;
 			}
 		}
-		if (diff < 3000)
+		fp_dbg("diff is %d", diff);
+		if (diff < sdev->diff_thresh) {
 			return;
+		}
 	}
 
-	sdev->rows = g_slist_prepend(sdev->rows, sdev->rowbuf);
-	sdev->num_rows++;
+	switch (sdev->finger_state) {
+	case AWAIT_FINGER:
+		if (!sdev->num_rows) {
+			sdev->rows = g_slist_prepend(sdev->rows, sdev->rowbuf);
+			sdev->num_rows++;
+		} else {
+			return;
+		}
+		break;
+	case FINGER_DETECTED:
+	case FINGER_REMOVED:
+		sdev->rows = g_slist_prepend(sdev->rows, sdev->rowbuf);
+		sdev->num_rows++;
+		break;
+	}
 	sdev->rowbuf = NULL;
 
 	if (sdev->num_rows >= MAX_ROWS) {
@@ -246,16 +321,16 @@ static void add_to_rowbuf(struct fp_img_dev *dev, unsigned char *data, int size)
 
 	memcpy(sdev->rowbuf + sdev->rowbuf_offset, data, size);
 	sdev->rowbuf_offset += size;
-	if (sdev->rowbuf_offset >= IMG_WIDTH)
+	if (sdev->rowbuf_offset >= sdev->img_width)
 		row_complete(dev);
+
 }
 
 static void start_new_row(struct sonly_dev *sdev, unsigned char *data, int size)
 {
 	if (!sdev->rowbuf)
-		sdev->rowbuf = g_malloc(IMG_WIDTH);
-	memcpy(sdev->rowbuf + IMG_WIDTH - 2, data, 2);
-	memcpy(sdev->rowbuf, data + 2, size - 2);
+		sdev->rowbuf = g_malloc(sdev->img_width);
+	memcpy(sdev->rowbuf, data, size);
 	sdev->rowbuf_offset = size;
 }
 
@@ -268,7 +343,7 @@ static int rowbuf_remaining(struct sonly_dev *sdev)
 	if (sdev->rowbuf_offset == -1)
 		return -1;
 
-	r = IMG_WIDTH - sdev->rowbuf_offset;
+	r = sdev->img_width - sdev->rowbuf_offset;
 	if (r > 62)
 		r = 62;
 	return r;
@@ -282,11 +357,56 @@ static void handle_packet(struct fp_img_dev *dev, unsigned char *data)
 	int for_rowbuf;
 	int next_row_addr;
 	int diff;
+	unsigned char dummy_data[62];
+
+	/* Init dummy data to something neutral */
+	memset (dummy_data, 204, 62);
 
 	data += 2; /* skip sequence number */
 	if (seqnum != sdev->last_seqnum + 1) {
-		if (seqnum != 0 && sdev->last_seqnum != 16383)
-			fp_warn("lost some data");
+		if (seqnum != 0 && sdev->last_seqnum != 16383) {
+			int missing_data = seqnum - sdev->last_seqnum;
+			int i;
+			fp_warn("lost %d packets of data between %d and %d", missing_data, sdev->last_seqnum, seqnum );
+
+			/* Minimize distortions for readers that lose a lot of packets */
+			for (i =1; i < missing_data; i++) {
+				abs_base_addr = (sdev->last_seqnum + 1) * 62;
+
+				/* If possible take the replacement data from last row */
+				if (sdev->num_rows > 1) {
+					int row_left = sdev->img_width - sdev->rowbuf_offset;
+					unsigned char *last_row = g_slist_nth_data (sdev->rows, 0);
+
+					if (row_left >= 62) {
+						memcpy(dummy_data, last_row + sdev->rowbuf_offset, 62);
+					} else {
+						memcpy(dummy_data, last_row + sdev->rowbuf_offset, row_left);
+						memcpy(dummy_data + row_left, last_row , 62 - row_left);
+					}
+				}
+
+				fp_warn("adding dummy input for %d, i=%d", sdev->last_seqnum + i, i);
+				for_rowbuf = rowbuf_remaining(sdev);
+				if (for_rowbuf != -1) {
+					add_to_rowbuf(dev, dummy_data, for_rowbuf);
+					/* row boundary */
+					if (for_rowbuf < 62) {
+						start_new_row(sdev, dummy_data + for_rowbuf, 62 - for_rowbuf);
+					}
+				} else if (abs_base_addr % sdev->img_width == 0) {
+					start_new_row(sdev, dummy_data, 62);
+				} else {
+					/* does the data in the packet reside on a row boundary?
+					 * if so capture it */
+					next_row_addr = ((abs_base_addr / sdev->img_width) + 1) * sdev->img_width;
+					diff = next_row_addr - abs_base_addr;
+					if (diff < 62)
+						start_new_row(sdev, dummy_data + diff, 62 - diff);
+				}
+				sdev->last_seqnum = sdev->last_seqnum + 1;
+			}
+		}
 	}
 	if (seqnum <= sdev->last_seqnum) {
 		fp_dbg("detected wraparound");
@@ -302,19 +422,22 @@ static void handle_packet(struct fp_img_dev *dev, unsigned char *data)
 	for_rowbuf = rowbuf_remaining(sdev);
 	if (for_rowbuf != -1) {
 		add_to_rowbuf(dev, data, for_rowbuf);
-		/* FIXME: we drop a row here */
+		/*row boundary*/
+		if (for_rowbuf < 62) {
+			start_new_row(sdev, data + for_rowbuf, 62 - for_rowbuf);
+		}
 		return;
 	}
 
 	/* does the packet START on a boundary? if so we want it in full */
-	if (abs_base_addr % IMG_WIDTH == 0) {
+	if (abs_base_addr % sdev->img_width == 0) {
 		start_new_row(sdev, data, 62);
 		return;
 	}
 
 	/* does the data in the packet reside on a row boundary?
 	 * if so capture it */
-	next_row_addr = ((abs_base_addr / IMG_WIDTH) + 1) * IMG_WIDTH;
+	next_row_addr = ((abs_base_addr / sdev->img_width) + 1) * sdev->img_width;
 	diff = next_row_addr - abs_base_addr;
 	if (diff < 62)
 		start_new_row(sdev, data + diff, 62 - diff);
@@ -395,7 +518,6 @@ static void write_regs_finished(struct write_regs_data *wrdata, int result)
 
 static void write_regs_iterate(struct write_regs_data *wrdata)
 {
-	struct fpi_ssm *ssm;
 	struct libusb_control_setup *setup;
 	const struct sonly_regwrite *regwrite;
 	int r;
@@ -406,7 +528,6 @@ static void write_regs_iterate(struct write_regs_data *wrdata)
 	}
 
 	regwrite = &wrdata->regs[wrdata->regs_written];
-	ssm = wrdata->ssm;
 
 	fp_dbg("set %02x=%02x", regwrite->reg, regwrite->value);
 	setup = libusb_control_transfer_get_setup(wrdata->transfer);
@@ -546,6 +667,7 @@ static void sm_await_intr_cb(struct libusb_transfer *transfer)
 {
 	struct fpi_ssm *ssm = transfer->user_data;
 	struct fp_img_dev *dev = ssm->priv;
+	struct sonly_dev *sdev = dev->priv;
 
 	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
 		g_free(transfer->buffer);
@@ -558,6 +680,7 @@ static void sm_await_intr_cb(struct libusb_transfer *transfer)
 		transfer->buffer[2], transfer->buffer[3]);
 	g_free(transfer->buffer);
 
+	sdev->finger_state = FINGER_DETECTED;
 	fpi_imgdev_report_finger_status(dev, TRUE);
 	fpi_ssm_next_state(ssm);
 }
@@ -591,236 +714,366 @@ static void sm_await_intr(struct fpi_ssm *ssm)
 
 /***** AWAIT FINGER *****/
 
-static const struct sonly_regwrite awfsm_writev_1[] = {
-	{ 0x0a, 0x00 }, { 0x0a, 0x00 }, { 0x09, 0x20 }, { 0x03, 0x3b },
-	{ 0x00, 0x67 }, { 0x00, 0x67 },
+enum awfsm_2016_states {
+	AWFSM_2016_WRITEV_1,
+	AWFSM_2016_READ_01,
+	AWFSM_2016_WRITE_01,
+	AWFSM_2016_WRITEV_2,
+	AWFSM_2016_READ_13,
+	AWFSM_2016_WRITE_13,
+	AWFSM_2016_WRITEV_3,
+	AWFSM_2016_READ_07,
+	AWFSM_2016_WRITE_07,
+	AWFSM_2016_WRITEV_4,
+	AWFSM_2016_NUM_STATES,
 };
 
-static const struct sonly_regwrite awfsm_writev_2[] = {
-	{ 0x01, 0xc6 }, { 0x0c, 0x13 }, { 0x0d, 0x0d }, { 0x0e, 0x0e },
-	{ 0x0f, 0x0d }, { 0x0b, 0x00 },
+enum awfsm_1000_states {
+	AWFSM_1000_WRITEV_1,
+	AWFSM_1000_WRITEV_2,
+	AWFSM_1000_NUM_STATES,
 };
 
-static const struct sonly_regwrite awfsm_writev_3[] = {
-	{ 0x13, 0x45 }, { 0x30, 0xe0 }, { 0x12, 0x01 }, { 0x20, 0x01 },
-	{ 0x09, 0x20 }, { 0x0a, 0x00 }, { 0x30, 0xe0 }, { 0x20, 0x01 },
-};
-
-static const struct sonly_regwrite awfsm_writev_4[] = {
-	{ 0x08, 0x00 }, { 0x10, 0x00 }, { 0x12, 0x01 }, { 0x11, 0xbf },
-	{ 0x12, 0x01 }, { 0x07, 0x10 }, { 0x07, 0x10 }, { 0x04, 0x00 },\
-	{ 0x05, 0x00 }, { 0x0b, 0x00 },
-	
-	/* enter finger detection mode */
-	{ 0x15, 0x20 }, { 0x30, 0xe1 }, { 0x15, 0x24 }, { 0x15, 0x04 },
-	{ 0x15, 0x84 },
-};
-
-enum awfsm_states {
-	AWFSM_WRITEV_1,
-	AWFSM_READ_01,
-	AWFSM_WRITE_01,
-	AWFSM_WRITEV_2,
-	AWFSM_READ_13,
-	AWFSM_WRITE_13,
-	AWFSM_WRITEV_3,
-	AWFSM_READ_07,
-	AWFSM_WRITE_07,
-	AWFSM_WRITEV_4,
-	AWFSM_NUM_STATES,
-};
-
-static void awfsm_run_state(struct fpi_ssm *ssm)
+static void awfsm_2016_run_state(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *dev = ssm->priv;
 	struct sonly_dev *sdev = dev->priv;
 
 	switch (ssm->cur_state) {
-	case AWFSM_WRITEV_1:
-		sm_write_regs(ssm, awfsm_writev_1, G_N_ELEMENTS(awfsm_writev_1));
+	case AWFSM_2016_WRITEV_1:
+		sm_write_regs(ssm, awfsm_2016_writev_1, G_N_ELEMENTS(awfsm_2016_writev_1));
 		break;
-	case AWFSM_READ_01:
+	case AWFSM_2016_READ_01:
 		sm_read_reg(ssm, 0x01);
 		break;
-	case AWFSM_WRITE_01:
+	case AWFSM_2016_WRITE_01:
 		if (sdev->read_reg_result != 0xc6)
 			sm_write_reg(ssm, 0x01, 0x46);
 		else
 			sm_write_reg(ssm, 0x01, 0xc6);
 		break;
-	case AWFSM_WRITEV_2:
-		sm_write_regs(ssm, awfsm_writev_2, G_N_ELEMENTS(awfsm_writev_2));
+	case AWFSM_2016_WRITEV_2:
+		sm_write_regs(ssm, awfsm_2016_writev_2, G_N_ELEMENTS(awfsm_2016_writev_2));
 		break;
-	case AWFSM_READ_13:
+	case AWFSM_2016_READ_13:
 		sm_read_reg(ssm, 0x13);
 		break;
-	case AWFSM_WRITE_13:
+	case AWFSM_2016_WRITE_13:
 		if (sdev->read_reg_result != 0x45)
 			sm_write_reg(ssm, 0x13, 0x05);
 		else
 			sm_write_reg(ssm, 0x13, 0x45);
 		break;
-	case AWFSM_WRITEV_3:
-		sm_write_regs(ssm, awfsm_writev_3, G_N_ELEMENTS(awfsm_writev_3));
+	case AWFSM_2016_WRITEV_3:
+		sm_write_regs(ssm, awfsm_2016_writev_3, G_N_ELEMENTS(awfsm_2016_writev_3));
 		break;
-	case AWFSM_READ_07:
+	case AWFSM_2016_READ_07:
 		sm_read_reg(ssm, 0x07);
 		break;
-	case AWFSM_WRITE_07:
+	case AWFSM_2016_WRITE_07:
 		if (sdev->read_reg_result != 0x10 && sdev->read_reg_result != 0x90)
 			fp_warn("odd reg7 value %x", sdev->read_reg_result);
 		sm_write_reg(ssm, 0x07, sdev->read_reg_result);
 		break;
-	case AWFSM_WRITEV_4:
-		sm_write_regs(ssm, awfsm_writev_4, G_N_ELEMENTS(awfsm_writev_4));
+	case AWFSM_2016_WRITEV_4:
+		sm_write_regs(ssm, awfsm_2016_writev_4, G_N_ELEMENTS(awfsm_2016_writev_4));
+		break;
+	}
+}
+
+static void awfsm_1000_run_state(struct fpi_ssm *ssm)
+{
+	switch (ssm->cur_state) {
+	case AWFSM_1000_WRITEV_1:
+		sm_write_regs(ssm, awfsm_1000_writev_1, G_N_ELEMENTS(awfsm_1000_writev_1));
+		break;
+	case AWFSM_1000_WRITEV_2:
+		sm_write_regs(ssm, awfsm_1000_writev_2, G_N_ELEMENTS(awfsm_1000_writev_2));
 		break;
 	}
 }
 
 /***** CAPTURE MODE *****/
-
-static const struct sonly_regwrite capsm_writev[] = {
-	/* enter capture mode */
-	{ 0x09, 0x28 }, { 0x13, 0x55 }, { 0x0b, 0x80 }, { 0x04, 0x00 },
-	{ 0x05, 0x00 },
+enum capsm_2016_states {
+	CAPSM_2016_INIT,
+	CAPSM_2016_WRITE_15,
+	CAPSM_2016_WRITE_30,
+	CAPSM_2016_FIRE_BULK,
+	CAPSM_2016_WRITEV,
+	CAPSM_2016_NUM_STATES,
 };
 
-enum capsm_states {
-	CAPSM_INIT,
-	CAPSM_WRITE_15,
-	CAPSM_WRITE_30,
-	CAPSM_FIRE_BULK,
-	CAPSM_WRITEV,
-	CAPSM_NUM_STATES,
+enum capsm_1000_states {
+	CAPSM_1000_INIT,
+	CAPSM_1000_FIRE_BULK,
+	CAPSM_1000_WRITEV,
+	CAPSM_1000_NUM_STATES,
 };
 
-static void capsm_run_state(struct fpi_ssm *ssm)
+enum capsm_1001_states {
+	CAPSM_1001_INIT,
+	CAPSM_1001_FIRE_BULK,
+	CAPSM_1001_WRITEV_1,
+	CAPSM_1001_WRITEV_2,
+	CAPSM_1001_WRITEV_3,
+	CAPSM_1001_WRITEV_4,
+	CAPSM_1001_WRITEV_5,
+	CAPSM_1001_NUM_STATES,
+};
+
+static void capsm_fire_bulk(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *dev = ssm->priv;
+	struct sonly_dev *sdev = dev->priv;
+	int i;
+	for (i = 0; i < NUM_BULK_TRANSFERS; i++) {
+		int r = libusb_submit_transfer(sdev->img_transfer[i]);
+		if (r < 0) {
+			if (i == 0) {
+				/* first one failed: easy peasy */
+				fpi_ssm_mark_aborted(ssm, r);
+				return;
+			}
+
+			/* cancel all flying transfers, and request that the SSM
+			 * gets aborted when the last transfer has dropped out of
+			 * the sky */
+			sdev->killing_transfers = ABORT_SSM;
+			sdev->kill_ssm = ssm;
+			sdev->kill_status_code = r;
+			cancel_img_transfers(dev);
+			return;
+		}
+		sdev->img_transfer_data[i].flying = TRUE;
+		sdev->num_flying++;
+	}
+	sdev->capturing = TRUE;
+	fpi_ssm_next_state(ssm);
+}
+
+static void capsm_2016_run_state(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *dev = ssm->priv;
 	struct sonly_dev *sdev = dev->priv;
 
 	switch (ssm->cur_state) {
-	case CAPSM_INIT:
+	case CAPSM_2016_INIT:
 		sdev->rowbuf_offset = -1;
 		sdev->num_rows = 0;
 		sdev->wraparounds = -1;
 		sdev->num_blank = 0;
-		sdev->finger_removed = 0;
+		sdev->num_nonblank = 0;
+		sdev->finger_state = FINGER_DETECTED;
 		sdev->last_seqnum = 16383;
 		sdev->killing_transfers = 0;
 		fpi_ssm_next_state(ssm);
 		break;
-	case CAPSM_WRITE_15:
+	case CAPSM_2016_WRITE_15:
 		sm_write_reg(ssm, 0x15, 0x20);
 		break;
-	case CAPSM_WRITE_30:
+	case CAPSM_2016_WRITE_30:
 		sm_write_reg(ssm, 0x30, 0xe0);
 		break;
-	case CAPSM_FIRE_BULK: ;
-		int i;
-		for (i = 0; i < NUM_BULK_TRANSFERS; i++) {
-			int r = libusb_submit_transfer(sdev->img_transfer[i]);
-			if (r < 0) {
-				if (i == 0) {
-					/* first one failed: easy peasy */
-					fpi_ssm_mark_aborted(ssm, r);
-					return;
-				}
+	case CAPSM_2016_FIRE_BULK: ;
+		capsm_fire_bulk (ssm);
+		break;
+	case CAPSM_2016_WRITEV:
+		sm_write_regs(ssm, capsm_2016_writev, G_N_ELEMENTS(capsm_2016_writev));
+		break;
+	}
+}
 
-				/* cancel all flying transfers, and request that the SSM
-				 * gets aborted when the last transfer has dropped out of
-				 * the sky */
-				sdev->killing_transfers = ABORT_SSM;
-				sdev->kill_ssm = ssm;
-				sdev->kill_status_code = r;
-				cancel_img_transfers(dev);
-				return;
-			}
-			sdev->img_transfer_data[i].flying = TRUE;
-			sdev->num_flying++;
-		}
-		sdev->capturing = TRUE;
+static void capsm_1000_run_state(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *dev = ssm->priv;
+	struct sonly_dev *sdev = dev->priv;
+
+	switch (ssm->cur_state) {
+	case CAPSM_1000_INIT:
+		sdev->rowbuf_offset = -1;
+		sdev->num_rows = 0;
+		sdev->wraparounds = -1;
+		sdev->num_blank = 0;
+		sdev->num_nonblank = 0;
+		sdev->finger_state = FINGER_DETECTED;
+		sdev->last_seqnum = 16383;
+		sdev->killing_transfers = 0;
 		fpi_ssm_next_state(ssm);
 		break;
-	case CAPSM_WRITEV:
-		sm_write_regs(ssm, capsm_writev, G_N_ELEMENTS(capsm_writev));
+	case CAPSM_1000_FIRE_BULK: ;
+		capsm_fire_bulk (ssm);
+		break;
+	case CAPSM_1000_WRITEV:
+		sm_write_regs(ssm, capsm_1000_writev, G_N_ELEMENTS(capsm_1000_writev));
+		break;
+	}
+}
+
+static void capsm_1001_run_state(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *dev = ssm->priv;
+	struct sonly_dev *sdev = dev->priv;
+
+	switch (ssm->cur_state) {
+	case CAPSM_1001_INIT:
+		sdev->rowbuf_offset = -1;
+		sdev->num_rows = 0;
+		sdev->wraparounds = -1;
+		sdev->num_blank = 0;
+		sdev->num_nonblank = 0;
+		sdev->finger_state = AWAIT_FINGER;
+		sdev->last_seqnum = 16383;
+		sdev->killing_transfers = 0;
+		fpi_ssm_next_state(ssm);
+		break;
+	case CAPSM_1001_FIRE_BULK: ;
+		capsm_fire_bulk (ssm);
+		break;
+	case CAPSM_1001_WRITEV_1:
+		sm_write_regs(ssm, capsm_1001_writev_1, G_N_ELEMENTS(capsm_1001_writev_1));
+		break;
+	case CAPSM_1001_WRITEV_2:
+		sm_write_regs(ssm, capsm_1001_writev_2, G_N_ELEMENTS(capsm_1001_writev_2));
+		break;
+	case CAPSM_1001_WRITEV_3:
+		sm_write_regs(ssm, capsm_1001_writev_3, G_N_ELEMENTS(capsm_1001_writev_3));
+		break;
+	case CAPSM_1001_WRITEV_4:
+		sm_write_regs(ssm, capsm_1001_writev_4, G_N_ELEMENTS(capsm_1001_writev_4));
+		break;
+	case CAPSM_1001_WRITEV_5:
+		sm_write_regs(ssm, capsm_1001_writev_5, G_N_ELEMENTS(capsm_1001_writev_5));
 		break;
 	}
 }
 
 /***** DEINITIALIZATION *****/
 
-static const struct sonly_regwrite deinitsm_writev[] = {
-	/* reset + enter low power mode */
-	{ 0x0b, 0x00 }, { 0x09, 0x20 }, { 0x13, 0x45 }, { 0x13, 0x45 },
+enum deinitsm_2016_states {
+	DEINITSM_2016_WRITEV,
+	DEINITSM_2016_NUM_STATES,
 };
 
-enum deinitsm_states {
-	DEINITSM_WRITEV,
-	DEINITSM_NUM_STATES,
+enum deinitsm_1000_states {
+	DEINITSM_1000_WRITEV,
+	DEINITSM_1000_NUM_STATES,
 };
 
-static void deinitsm_run_state(struct fpi_ssm *ssm)
+enum deinitsm_1001_states {
+	DEINITSM_1001_WRITEV,
+	DEINITSM_1001_NUM_STATES,
+};
+
+static void deinitsm_2016_run_state(struct fpi_ssm *ssm)
 {
 	switch (ssm->cur_state) {
-	case DEINITSM_WRITEV:
-		sm_write_regs(ssm, deinitsm_writev, G_N_ELEMENTS(deinitsm_writev));
+	case DEINITSM_2016_WRITEV:
+		sm_write_regs(ssm, deinitsm_2016_writev, G_N_ELEMENTS(deinitsm_2016_writev));
+		break;
+	}
+}
+
+static void deinitsm_1000_run_state(struct fpi_ssm *ssm)
+{
+	switch (ssm->cur_state) {
+	case DEINITSM_1000_WRITEV:
+		sm_write_regs(ssm, deinitsm_1000_writev, G_N_ELEMENTS(deinitsm_1000_writev));
+		break;
+	}
+}
+
+static void deinitsm_1001_run_state(struct fpi_ssm *ssm)
+{
+	switch (ssm->cur_state) {
+	case DEINITSM_1001_WRITEV:
+		sm_write_regs(ssm, deinitsm_1001_writev, G_N_ELEMENTS(deinitsm_1001_writev));
 		break;
 	}
 }
 
 /***** INITIALIZATION *****/
 
-static const struct sonly_regwrite initsm_writev_1[] = {
-	{ 0x49, 0x00 },
-	
-	/* BSAPI writes different values to register 0x3e each time. I initially
-	 * thought this was some kind of clever authentication, but just blasting
-	 * these sniffed values each time seems to work. */
-	{ 0x3e, 0x83 }, { 0x3e, 0x4f }, { 0x3e, 0x0f }, { 0x3e, 0xbf },
-	{ 0x3e, 0x45 }, { 0x3e, 0x35 }, { 0x3e, 0x1c }, { 0x3e, 0xae },
-
-	{ 0x44, 0x01 }, { 0x43, 0x06 }, { 0x43, 0x05 }, { 0x43, 0x04 },
-	{ 0x44, 0x00 }, { 0x0b, 0x00 },
+enum initsm_2016_states {
+	INITSM_2016_WRITEV_1,
+	INITSM_2016_READ_09,
+	INITSM_2016_WRITE_09,
+	INITSM_2016_READ_13,
+	INITSM_2016_WRITE_13,
+	INITSM_2016_WRITE_04,
+	INITSM_2016_WRITE_05,
+	INITSM_2016_NUM_STATES,
 };
 
-enum initsm_states {
-	INITSM_WRITEV_1,
-	INITSM_READ_09,
-	INITSM_WRITE_09,
-	INITSM_READ_13,
-	INITSM_WRITE_13,
-	INITSM_WRITE_04,
-	INITSM_WRITE_05,
-	INITSM_NUM_STATES,
+enum initsm_1000_states {
+	INITSM_1000_WRITEV_1,
+	INITSM_1000_NUM_STATES,
 };
 
-static void initsm_run_state(struct fpi_ssm *ssm)
+enum initsm_1001_states {
+	INITSM_1001_WRITEV_1,
+	INITSM_1001_WRITEV_2,
+	INITSM_1001_WRITEV_3,
+	INITSM_1001_WRITEV_4,
+	INITSM_1001_WRITEV_5,
+	INITSM_1001_NUM_STATES,
+};
+
+static void initsm_2016_run_state(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *dev = ssm->priv;
 	struct sonly_dev *sdev = dev->priv;
 
 	switch (ssm->cur_state) {
-	case INITSM_WRITEV_1:
-		sm_write_regs(ssm, initsm_writev_1, G_N_ELEMENTS(initsm_writev_1));
+	case INITSM_2016_WRITEV_1:
+		sm_write_regs(ssm, initsm_2016_writev_1, G_N_ELEMENTS(initsm_2016_writev_1));
 		break;
-	case INITSM_READ_09:
+	case INITSM_2016_READ_09:
 		sm_read_reg(ssm, 0x09);
 		break;
-	case INITSM_WRITE_09:
+	case INITSM_2016_WRITE_09:
 		sm_write_reg(ssm, 0x09, sdev->read_reg_result & ~0x08);
 		break;
-	case INITSM_READ_13:
+	case INITSM_2016_READ_13:
 		sm_read_reg(ssm, 0x13);
 		break;
-	case INITSM_WRITE_13:
+	case INITSM_2016_WRITE_13:
 		sm_write_reg(ssm, 0x13, sdev->read_reg_result & ~0x10);
 		break;
-	case INITSM_WRITE_04:
+	case INITSM_2016_WRITE_04:
 		sm_write_reg(ssm, 0x04, 0x00);
 		break;
-	case INITSM_WRITE_05:
+	case INITSM_2016_WRITE_05:
 		sm_write_reg(ssm, 0x05, 0x00);
+		break;
+	}
+}
+
+static void initsm_1000_run_state(struct fpi_ssm *ssm)
+{
+	switch (ssm->cur_state) {
+	case INITSM_1000_WRITEV_1:
+		sm_write_regs(ssm, initsm_1000_writev_1, G_N_ELEMENTS(initsm_1000_writev_1));
+		break;
+	}
+}
+
+static void initsm_1001_run_state(struct fpi_ssm *ssm)
+{
+	switch (ssm->cur_state) {
+	case INITSM_1001_WRITEV_1:
+		sm_write_regs(ssm, initsm_1001_writev_1, G_N_ELEMENTS(initsm_1001_writev_1));
+		break;
+	case INITSM_1001_WRITEV_2:
+		sm_write_regs(ssm, initsm_1001_writev_2, G_N_ELEMENTS(initsm_1001_writev_2));
+		break;
+	case INITSM_1001_WRITEV_3:
+		sm_write_regs(ssm, initsm_1001_writev_3, G_N_ELEMENTS(initsm_1001_writev_3));
+		break;
+	case INITSM_1001_WRITEV_4:
+		sm_write_regs(ssm, initsm_1001_writev_4, G_N_ELEMENTS(initsm_1001_writev_4));
+		break;
+	case INITSM_1001_WRITEV_5:
+		sm_write_regs(ssm, initsm_1001_writev_5, G_N_ELEMENTS(initsm_1001_writev_5));
 		break;
 	}
 }
@@ -844,31 +1097,82 @@ static void loopsm_run_state(struct fpi_ssm *ssm)
 
 	switch (ssm->cur_state) {
 	case LOOPSM_RUN_AWFSM: ;
-		if (sdev->deactivating) {
-			fpi_ssm_mark_completed(ssm);
-		} else {
-			struct fpi_ssm *awfsm = fpi_ssm_new(dev->dev, awfsm_run_state,
-				AWFSM_NUM_STATES);
-			awfsm->priv = dev;
-			fpi_ssm_start_subsm(ssm, awfsm);
+		switch (sdev->dev_model) {
+		case UPEKSONLY_1001:
+			if (sdev->deactivating) {
+				fpi_ssm_mark_completed(ssm);
+			} else {
+				fpi_ssm_next_state(ssm);
+			}
+		break;
+		default:
+			if (sdev->deactivating) {
+				fpi_ssm_mark_completed(ssm);
+			} else {
+				struct fpi_ssm *awfsm = NULL;
+				switch (sdev->dev_model) {
+				case UPEKSONLY_2016:
+					awfsm = fpi_ssm_new(dev->dev, awfsm_2016_run_state,
+						AWFSM_2016_NUM_STATES);
+					break;
+				case UPEKSONLY_1000:
+					awfsm = fpi_ssm_new(dev->dev, awfsm_1000_run_state,
+						AWFSM_1000_NUM_STATES);
+					break;
+				}
+				awfsm->priv = dev;
+				fpi_ssm_start_subsm(ssm, awfsm);
+			}
+			break;
 		}
 		break;
 	case LOOPSM_AWAIT_FINGER:
-		sm_await_intr(ssm);
+		switch (sdev->dev_model) {
+		case UPEKSONLY_1001:
+			fpi_ssm_next_state(ssm);
+			break;
+		default:
+			sm_await_intr(ssm);
+			break;
+		}
 		break;
 	case LOOPSM_RUN_CAPSM: ;
-		struct fpi_ssm *capsm = fpi_ssm_new(dev->dev, capsm_run_state,
-			CAPSM_NUM_STATES);
+		struct fpi_ssm *capsm = NULL;
+		switch (sdev->dev_model) {
+		case UPEKSONLY_2016:
+			capsm = fpi_ssm_new(dev->dev, capsm_2016_run_state,
+				CAPSM_2016_NUM_STATES);
+			break;
+		case UPEKSONLY_1000:
+			capsm = fpi_ssm_new(dev->dev, capsm_1000_run_state,
+				CAPSM_1000_NUM_STATES);
+			break;
+		case UPEKSONLY_1001:
+			capsm = fpi_ssm_new(dev->dev, capsm_1001_run_state,
+				CAPSM_1001_NUM_STATES);
+			break;
+		}
 		capsm->priv = dev;
 		fpi_ssm_start_subsm(ssm, capsm);
 		break;
 	case LOOPSM_CAPTURE:
-		/* bulk URBs already flying, so just wait for image completion
-		 * to push us into next state */
 		break;
 	case LOOPSM_RUN_DEINITSM: ;
-		struct fpi_ssm *deinitsm = fpi_ssm_new(dev->dev, deinitsm_run_state,
-			DEINITSM_NUM_STATES);
+		struct fpi_ssm *deinitsm = NULL;
+		switch (sdev->dev_model) {
+		case UPEKSONLY_2016:
+			deinitsm = fpi_ssm_new(dev->dev, deinitsm_2016_run_state,
+				DEINITSM_2016_NUM_STATES);
+			break;
+		case UPEKSONLY_1000:
+			deinitsm = fpi_ssm_new(dev->dev, deinitsm_1000_run_state,
+				DEINITSM_1000_NUM_STATES);
+			break;
+		case UPEKSONLY_1001:
+			deinitsm = fpi_ssm_new(dev->dev, deinitsm_1001_run_state,
+				DEINITSM_1001_NUM_STATES);
+			break;
+		}
 		sdev->capturing = FALSE;
 		deinitsm->priv = dev;
 		fpi_ssm_start_subsm(ssm, deinitsm);
@@ -952,7 +1256,7 @@ static void initsm_complete(struct fpi_ssm *ssm)
 static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 {
 	struct sonly_dev *sdev = dev->priv;
-	struct fpi_ssm *ssm;
+	struct fpi_ssm *ssm = NULL;
 	int i;
 
 	sdev->deactivating = FALSE;
@@ -977,7 +1281,17 @@ static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 			4096, img_data_cb, &sdev->img_transfer_data[i], 0);
 	}
 
-	ssm = fpi_ssm_new(dev->dev, initsm_run_state, INITSM_NUM_STATES);
+	switch (sdev->dev_model) {
+	case UPEKSONLY_2016:
+		ssm = fpi_ssm_new(dev->dev, initsm_2016_run_state, INITSM_2016_NUM_STATES);
+		break;
+	case UPEKSONLY_1000:
+		ssm = fpi_ssm_new(dev->dev, initsm_1000_run_state, INITSM_1000_NUM_STATES);
+		break;
+	case UPEKSONLY_1001:
+		ssm = fpi_ssm_new(dev->dev, initsm_1001_run_state, INITSM_1001_NUM_STATES);
+		break;
+	}
 	ssm->priv = dev;
 	fpi_ssm_start(ssm, initsm_complete);
 	return 0;
@@ -986,6 +1300,7 @@ static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 static int dev_init(struct fp_img_dev *dev, unsigned long driver_data)
 {
 	int r;
+	struct sonly_dev *sdev;
 
 	r = libusb_set_configuration(dev->udev, 1);
 	if (r < 0) {
@@ -999,7 +1314,28 @@ static int dev_init(struct fp_img_dev *dev, unsigned long driver_data)
 		return r;
 	}
 
-	dev->priv = g_malloc0(sizeof(struct sonly_dev));
+	sdev = dev->priv = g_malloc0(sizeof(struct sonly_dev));
+	sdev->dev_model = (int)driver_data;
+	switch (driver_data) {
+	case UPEKSONLY_1000:
+		sdev->img_width = IMG_WIDTH_1000;
+		upeksonly_driver.img_width = IMG_WIDTH_1000;
+		sdev->diff_thresh = 3000;
+		sdev->total_thresh = 52000;
+		break;
+	case UPEKSONLY_1001:
+		sdev->img_width = IMG_WIDTH_1001;
+		upeksonly_driver.img_width = IMG_WIDTH_1001;
+		sdev->diff_thresh = 1300;
+		sdev->total_thresh = 40000;
+		break;
+	case UPEKSONLY_2016:
+		sdev->img_width = IMG_WIDTH_2016;
+		upeksonly_driver.img_width = IMG_WIDTH_2016;
+		sdev->diff_thresh = 3000;
+		sdev->total_thresh = 52000;
+		break;
+	}
 	fpi_imgdev_open_complete(dev, 0);
 	return 0;
 }
@@ -1011,23 +1347,45 @@ static void dev_deinit(struct fp_img_dev *dev)
 	fpi_imgdev_close_complete(dev);
 }
 
+static int dev_discover(struct libusb_device_descriptor *dsc, uint32_t *devtype)
+{
+	if (dsc->idProduct == 0x2016) {
+		if (dsc->bcdDevice == 1) /* Revision 1 is what we're interested in */
+			return 1;
+	}
+	if (dsc->idProduct == 0x1000) {
+		if (dsc->bcdDevice == 0x0033) /* Looking for revision 0.33 */
+			return 1;
+	}
+
+	if (dsc->idProduct == 0x1001) {
+		return 1;
+	}
+
+	return 0;
+}
+
 static const struct usb_id id_table[] = {
-	{ .vendor = 0x147e, .product = 0x2016 },
+	{ .vendor = 0x147e, .product = 0x2016, .driver_data = UPEKSONLY_2016 },
+	{ .vendor = 0x147e, .product = 0x1000, .driver_data = UPEKSONLY_1000 },
+	{ .vendor = 0x147e, .product = 0x1001, .driver_data = UPEKSONLY_1001 },
 	{ 0, 0, 0, },
 };
 
 struct fp_img_driver upeksonly_driver = {
 	.driver = {
-		.id = 9,
+		.id = UPEKSONLY_ID,
 		.name = FP_COMPONENT,
 		.full_name = "UPEK TouchStrip Sensor-Only",
 		.id_table = id_table,
 		.scan_type = FP_SCAN_TYPE_SWIPE,
+		.discover = dev_discover,
 	},
 	.flags = 0,
-	.img_width = IMG_WIDTH,
+	.img_width = -1,
 	.img_height = -1,
 
+	.bz3_threshold = 30,
 	.open = dev_init,
 	.close = dev_deinit,
 	.activate = dev_activate,

@@ -291,25 +291,25 @@ void fpi_log(enum fpi_log_level level, const char *component,
 #ifndef ENABLE_DEBUG_LOGGING
 	if (!log_level)
 		return;
-	if (level == LOG_LEVEL_WARNING && log_level < 2)
+	if (level == FPRINT_LOG_LEVEL_WARNING && log_level < 2)
 		return;
-	if (level == LOG_LEVEL_INFO && log_level < 3)
+	if (level == FPRINT_LOG_LEVEL_INFO && log_level < 3)
 		return;
 #endif
 
 	switch (level) {
-	case LOG_LEVEL_INFO:
+	case FPRINT_LOG_LEVEL_INFO:
 		prefix = "info";
 		break;
-	case LOG_LEVEL_WARNING:
+	case FPRINT_LOG_LEVEL_WARNING:
 		stream = stderr;
 		prefix = "warning";
 		break;
-	case LOG_LEVEL_ERROR:
+	case FPRINT_LOG_LEVEL_ERROR:
 		stream = stderr;
 		prefix = "error";
 		break;
-	case LOG_LEVEL_DEBUG:
+	case FPRINT_LOG_LEVEL_DEBUG:
 		stream = stderr;
 		prefix = "debug";
 		break;
@@ -343,14 +343,23 @@ static struct fp_driver * const primitive_drivers[] = {
 #ifdef ENABLE_UPEKTS
 	&upekts_driver,
 #endif
+#ifdef ENABLE_UPEKE2
+    &upeke2_driver,
+#endif
 };
 
 static struct fp_img_driver * const img_drivers[] = {
+#ifdef ENABLE_AES3500
+	&aes3500_driver,
+#endif
 #ifdef ENABLE_AES4000
 	&aes4000_driver,
 #endif
 #ifdef ENABLE_AES2501
 	&aes2501_driver,
+#endif
+#ifdef ENABLE_AES2550
+	&aes2550_driver,
 #endif
 #ifdef ENABLE_URU4000
 	&uru4000_driver,
@@ -361,14 +370,32 @@ static struct fp_img_driver * const img_drivers[] = {
 #ifdef ENABLE_UPEKSONLY
 	&upeksonly_driver,
 #endif
-	/*
+
 #ifdef ENABLE_AES1610
 	&aes1610_driver,
+#endif
+#ifdef ENABLE_AES1660
+	&aes1660_driver,
+#endif
+#ifdef ENABLE_AES2660
+	&aes2660_driver,
+#endif
+#ifdef ENABLE_VFS101
+	&vfs101_driver,
+#endif
+#ifdef ENABLE_VFS301
+	&vfs301_driver,
 #endif
 #ifdef ENABLE_UPEKTC
 	&upektc_driver,
 #endif
-#ifdef ENABLE_FDU2000
+#ifdef ENABLE_UPEKTC_IMG
+	&upektc_img_driver,
+#endif
+#ifdef ENABLE_ETES603
+	&etes603_driver,
+#endif
+/*#ifdef ENABLE_FDU2000
 	&fdu2000_driver,
 #endif
 	*/
@@ -407,50 +434,81 @@ API_EXPORTED struct fp_driver **fprint_get_drivers (void)
 }
 
 static struct fp_driver *find_supporting_driver(libusb_device *udev,
-	const struct usb_id **usb_id)
+	const struct usb_id **usb_id, uint32_t *devtype)
 {
 	int ret;
 	GSList *elem = registered_drivers;
 	struct libusb_device_descriptor dsc;
+
+	const struct usb_id *best_usb_id;
+	struct fp_driver *best_drv;
+	uint32_t best_devtype;
+	int drv_score = 0;
 
 	ret = libusb_get_device_descriptor(udev, &dsc);
 	if (ret < 0) {
 		fp_err("Failed to get device descriptor");
 		return NULL;
 	}
-	
+
+	best_drv = NULL;
+	best_devtype = 0;
+
 	do {
 		struct fp_driver *drv = elem->data;
+		uint32_t type = 0;
 		const struct usb_id *id;
 
-		for (id = drv->id_table; id->vendor; id++)
+		for (id = drv->id_table; id->vendor; id++) {
 			if (dsc.idVendor == id->vendor && dsc.idProduct == id->product) {
+				if (drv->discover) {
+					int r = drv->discover(&dsc, &type);
+					if (r < 0)
+						fp_err("%s discover failed, code %d", drv->name, r);
+					if (r <= 0)
+						continue;
+					/* Has a discover function, and matched our device */
+					drv_score = 100;
+				} else {
+					/* Already got a driver as good */
+					if (drv_score >= 50)
+						continue;
+					drv_score = 50;
+				}
 				fp_dbg("driver %s supports USB device %04x:%04x",
 					drv->name, id->vendor, id->product);
-				*usb_id = id;
-				return drv;
+				best_usb_id = id;
+				best_drv = drv;
+				best_devtype = type;
+
+				/* We found the best possible driver */
+				if (drv_score == 100)
+					break;
 			}
+		}
 	} while ((elem = g_slist_next(elem)));
-	return NULL;
+
+	if (best_drv != NULL) {
+		fp_dbg("selected driver %s supports USB device %04x:%04x",
+		       best_drv->name, dsc.idVendor, dsc.idProduct);
+		*devtype = best_devtype;
+		*usb_id = best_usb_id;
+	}
+
+	return best_drv;
 }
 
 static struct fp_dscv_dev *discover_dev(libusb_device *udev)
 {
 	const struct usb_id *usb_id;
-	struct fp_driver *drv = find_supporting_driver(udev, &usb_id);
+	struct fp_driver *drv;
 	struct fp_dscv_dev *ddev;
-	uint32_t devtype = 0;
+	uint32_t devtype;
+
+	drv = find_supporting_driver(udev, &usb_id, &devtype);
 
 	if (!drv)
 		return NULL;
-
-	if (drv->discover) {
-		int r = drv->discover(usb_id, &devtype);
-		if (r < 0)
-			fp_err("%s discover failed, code %d", drv->name, r);
-		if (r <= 0)
-			return NULL;
-	}
 
 	ddev = g_malloc0(sizeof(*ddev));
 	ddev->drv = drv;
@@ -752,7 +810,7 @@ static struct fp_img_dev *dev_to_img_dev(struct fp_dev *dev)
  */
 API_EXPORTED int fp_dev_supports_imaging(struct fp_dev *dev)
 {
-	return dev->drv->type == DRIVER_IMAGING;
+	return dev->drv->capture_start != NULL;
 }
 
 /** \ingroup dev
@@ -765,38 +823,6 @@ API_EXPORTED int fp_dev_supports_imaging(struct fp_dev *dev)
 API_EXPORTED int fp_dev_supports_identification(struct fp_dev *dev)
 {
 	return dev->drv->identify_start != NULL;
-}
-
-/** \ingroup dev
- * Captures an \ref img "image" from a device. The returned image is the raw
- * image provided by the device, you may wish to \ref img_std "standardize" it.
- *
- * If set, the <tt>unconditional</tt> flag indicates that the device should
- * capture an image unconditionally, regardless of whether a finger is there
- * or not. If unset, this function will block until a finger is detected on
- * the sensor.
- *
- * \param dev the device
- * \param unconditional whether to unconditionally capture an image, or to only capture when a finger is detected
- * \param image a location to return the captured image. Must be freed with
- * fp_img_free() after use.
- * \return 0 on success, non-zero on error. -ENOTSUP indicates that either the
- * unconditional flag was set but the device does not support this, or that the
- * device does not support imaging.
- * \sa fp_dev_supports_imaging()
- */
-API_EXPORTED int fp_dev_img_capture(struct fp_dev *dev, int unconditional,
-	struct fp_img **image)
-{
-	struct fp_img_dev *imgdev = dev_to_img_dev(dev);
-	if (!imgdev) {
-		fp_dbg("image capture on non-imaging device");
-		return -ENOTSUP;
-	}
-
-	//return fpi_imgdev_capture(imgdev, unconditional, image);
-	/* FIXME reimplement async */
-	return -ENOTSUP;
 }
 
 /** \ingroup dev
